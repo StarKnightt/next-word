@@ -36,7 +36,7 @@ if (args[0] === "--stills") {
     "-f", "image2pipe", "-framerate", String(FPS), "-c:v", "png", "-i", "-",
     "-i", wav,
     "-map", "0:v", "-map", "1:a",
-    "-c:v", "libx264", "-preset", "slow", "-crf", "15", "-pix_fmt", "yuv420p",
+    "-c:v", "libx264", "-preset", "slow", "-b:v", "20M", "-maxrate", "26M", "-bufsize", "40M", "-pix_fmt", "yuv420p", // grain is costly: cap the bitrate so the file stays under GitHub's 100 MB
     "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
     "-c:a", "aac", "-b:a", "320k", "-ar", "48000",
     "-t", String(DURATION), "-movflags", "+faststart", mp4,
