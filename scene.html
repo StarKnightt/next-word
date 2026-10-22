@@ -1,0 +1,392 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>How an AI picks its next word</title>
+<style>
+  @font-face { font-family: "Disp"; src: url("fonts/InterDisplay-SemiBold.otf"); font-weight: 600; }
+  @font-face { font-family: "Text"; src: url("fonts/Inter-Medium.otf"); font-weight: 500; }
+  html, body { margin: 0; width: 1920px; height: 1080px; background: #000; overflow: hidden; }
+  #stage { position: absolute; inset: 0; background: #000; }
+  .abs { position: absolute; left: 0; top: 0; will-change: transform, opacity; white-space: pre; }
+  .word { font-family: "Disp"; font-weight: 600; color: #f5f3f0; line-height: 1; letter-spacing: -0.02em; }
+  .pill { border-radius: 999px; border: 2px solid rgba(255,255,255,0.16); background: rgba(255,255,255,0.045); box-sizing: border-box; }
+  .num { font-family: "Text"; font-weight: 500; font-size: 40px; line-height: 1; font-feature-settings: "tnum" 1; color: #6e6e6e; }
+  .caption { font-family: "Text"; font-weight: 500; font-size: 40px; line-height: 1; color: #8c8c8c; letter-spacing: 0.005em; }
+  .bar { height: 14px; border-radius: 7px; }
+  .pct { font-family: "Text"; font-weight: 500; font-size: 52px; line-height: 1; font-feature-settings: "tnum" 1; }
+  svg { position: absolute; left: 0; top: 0; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<script>
+// Every frame is a pure function of t (seconds). No CSS animations, no clocks.
+const W = 1920, H = 1080, ACCENT = "#ff6a3d";
+const stage = document.getElementById("stage");
+
+// ---------- math ----------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, p) => a + (b - a) * p;
+const easeInOut = p => p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+const easeOut = p => 1 - Math.pow(1 - p, 3);
+const easeOutExpo = p => p >= 1 ? 1 : 1 - Math.pow(2, -10 * p);
+const easeInOutQuint = p => p < 0.5 ? 16 * p ** 5 : 1 - Math.pow(-2 * p + 2, 5) / 2;
+const seg = (t, a, b, e = easeInOut) => e(clamp((t - a) / (b - a)));
+const hash = (...n) => {
+  let h = 2166136261;
+  for (const v of n) { h ^= (v * 374761393) | 0; h = Math.imul(h, 16777619); h ^= h >>> 13; }
+  return ((h >>> 0) % 100000) / 100000;
+};
+
+// ---------- elements ----------
+function el(cls, parent = stage, tag = "div") {
+  const e = document.createElement(tag);
+  e.className = "abs " + cls;
+  parent.appendChild(e);
+  return e;
+}
+function place(e, x, y, o = 1, extra = "") {
+  e.style.transform = `translate(${x}px, ${y}px)` + extra;
+  e.style.opacity = o;
+}
+
+const WORDS = ["the", "cat", "sat", "on", "the", "mat"];
+const pills = WORDS.map(() => el("pill"));
+const words = WORDS.map(w => { const e = el("word"); e.textContent = w; return e; });
+const cursor = el("");
+cursor.style.background = ACCENT;
+cursor.style.borderRadius = "3px";
+
+// measure word widths at 100px
+const ctx = document.createElement("canvas").getContext("2d");
+let WIDTH = {}, SPACE = 0;
+function measure() {
+  ctx.font = '600 100px "Disp"';
+  ctx.letterSpacing = "-2px";
+  for (const w of WORDS) WIDTH[w] = ctx.measureText(w).width;
+  SPACE = ctx.measureText("a a").width - ctx.measureText("aa").width;
+}
+const wpx = (i, fs) => WIDTH[WORDS[i]] * fs / 100;
+
+// prefix width for typing (letters measured individually at the same size)
+function prefixWidth(i, n, fs) {
+  ctx.font = `600 ${fs}px "Disp"`;
+  ctx.letterSpacing = `${-0.02 * fs}px`;
+  return ctx.measureText(WORDS[i].slice(0, n)).width;
+}
+
+// ---------- poses ----------
+// a pose is {x, cy, fs} per word: x = left edge, cy = vertical centre
+function linePose(n, fs, gap, cy) {
+  const total = [...Array(n).keys()].reduce((s, i) => s + wpx(i, fs), 0) + gap * (n - 1);
+  let x = W / 2 - total / 2;
+  const out = [];
+  for (let i = 0; i < WORDS.length; i++) {
+    out.push({ x, cy, fs });
+    if (i < n) x += wpx(i, fs) + gap;
+  }
+  return out;
+}
+function stackPose() {
+  const fs = 84, out = [];
+  for (let i = 0; i < 6; i++) {
+    out.push({ x: 430 - wpx(Math.min(i, 4), fs), cy: 540 + (Math.min(i, 4) - 2) * 150, fs });
+  }
+  return out;
+}
+const mixPose = (a, b, p) => a.map((q, i) => ({
+  x: lerp(q.x, b[i].x, p), cy: lerp(q.cy, b[i].cy, p), fs: lerp(q.fs, b[i].fs, p)
+}));
+
+let P = {};
+function buildPoses() {
+  P.line = linePose(5, 128, SPACE * 1.28, 540);
+  P.chips = linePose(5, 112, 0.98 * 112, 560);
+  P.stack = stackPose();
+  P.pred = linePose(6, 92, SPACE * 0.92, 270);
+  P.final = linePose(6, 124, SPACE * 1.24, 540);
+}
+
+// ---------- typing ----------
+const TYPE_START = 0.55;
+const chars = []; // [wordIndex, charCount, time]
+(function () {
+  let tt = TYPE_START;
+  for (let i = 0; i < 5; i++) {
+    for (let c = 1; c <= WORDS[i].length; c++) {
+      tt += 0.085 + hash(i, c) * 0.05;
+      chars.push([i, c, tt]);
+    }
+    tt += 0.11 + hash(i, 99) * 0.05; // space
+  }
+})();
+const TYPE_END = chars[chars.length - 1][2];
+
+// ---------- captions ----------
+const CAPS = [
+  ["how an AI picks its next word", 0.2, 4.3],
+  ["first, the text is cut into tokens", 4.7, 8.9],
+  ["each token becomes a list of numbers", 9.2, 13.6],
+  ["then the words look at each other", 14.1, 18.9],
+  ["it scores every word it knows", 19.2, 23.9],
+  ["and picks one", 24.2, 26.7],
+];
+const caps = CAPS.map(([s]) => { const e = el("caption"); e.textContent = s; return e; });
+let capW = [];
+
+// ---------- numbers (beat 3) ----------
+const ROWS = 5, COLS = 10, COL0 = 500, COLW = 152;
+const nums = [];
+for (let r = 0; r < ROWS; r++) {
+  nums.push([]);
+  for (let c = 0; c < COLS; c++) nums[r].push(el("num"));
+}
+const fmt = v => (v < 0 ? "−" : " ") + Math.abs(v).toFixed(2);
+
+// ---------- attention (beat 4) ----------
+const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+svg.setAttribute("width", W); svg.setAttribute("height", H);
+stage.appendChild(svg);
+// [from, to, side (-1 above, 1 below), height, width, start]
+const LINKS = [[4, 2, -1, 170, 3, 14.5], [4, 1, -1, 285, 3.5, 14.85], [2, 1, 1, 150, 2.5, 15.2]];
+const arcs = LINKS.map(() => {
+  const p = document.createElementNS(svg.namespaceURI, "path");
+  p.setAttribute("fill", "none"); p.setAttribute("stroke", ACCENT); p.setAttribute("stroke-linecap", "round");
+  svg.appendChild(p); return p;
+});
+const dots = LINKS.map(() => {
+  const c = document.createElementNS(svg.namespaceURI, "circle");
+  c.setAttribute("r", 6); c.setAttribute("fill", "#ffd2c2");
+  svg.appendChild(c); return c;
+});
+
+// ---------- prediction (beat 5) ----------
+const CANDS = [["mat", 62], ["floor", 14], ["couch", 9], ["bed", 6]];
+const candWords = CANDS.map(([w], i) => {
+  if (i === 0) return null; // "mat" is the sentence's 6th word element
+  const e = el("word"); e.textContent = w; return e;
+});
+const bars = CANDS.map(() => el("bar"));
+const pcts = CANDS.map(() => el("pct"));
+const CAND_FS = 72, CAND_RIGHT = 760, BAR_X = 810, BAR_MAX = 640;
+const candY = i => 490 + i * 122;
+let candWidth = [];
+
+// ---------- finale ----------
+const fin1 = el("word"); fin1.textContent = "that’s it.";
+const fin2 = el("word"); fin2.textContent = "one word at a time.";
+fin1.style.fontSize = fin2.style.fontSize = "128px";
+fin2.style.color = ACCENT;
+
+// =================================================================
+function renderFrame(t) {
+  // ---- sentence pose over time ----
+  const stag = (i, a, b, e = easeInOutQuint) => seg(t, a + i * 0.07, b + i * 0.07, e);
+  let pose = P.line.map((q, i) => {
+    let s = q;
+    s = mixPose([s], [P.chips[i]], stag(i, 4.55, 5.75))[0];
+    s = mixPose([s], [P.stack[i]], stag(i, 9.0, 10.0))[0];
+    s = mixPose([s], [P.chips[i]], stag(4 - Math.min(i, 4), 12.9, 13.9))[0];
+    s = mixPose([s], [P.pred[i]], seg(t, 19.0, 20.0, easeInOutQuint))[0];
+    s = mixPose([s], [P.final[i]], seg(t, 25.9, 26.8, easeInOutQuint))[0];
+    return s;
+  });
+
+  // sentence exit before the finale
+  const exit = seg(t, 26.85, 27.3, easeInOut);
+
+  // ---- words ----
+  const dimP = seg(t, 14.7, 15.4) * (1 - seg(t, 18.3, 19.0));
+  for (let i = 0; i < 6; i++) {
+    const w = words[i], q = pose[i];
+    let o = 1, color = "#f5f3f0", text = WORDS[i];
+    if (i < 5) {
+      // typing
+      let n = 0;
+      for (const [wi, c, tt] of chars) if (wi === i && t >= tt) n = c;
+      text = WORDS[i].slice(0, n);
+      if (i === 0 || i === 3) o = lerp(1, 0.28, dimP);
+    } else {
+      text = "mat";
+    }
+    w.textContent = text;
+    let x = q.x, cy = q.cy, fs = q.fs;
+
+    if (i === 5) {
+      // "mat" lives in the candidate list, then flies into the sentence
+      const rise = seg(t, 19.55, 20.35, easeOut);
+      const listX = CAND_RIGHT - wpx(5, CAND_FS), listY = candY(0);
+      const fly = seg(t, 24.45, 25.45, easeInOutQuint);
+      x = lerp(listX, q.x, fly);
+      cy = lerp(listY + (1 - rise) * 60, q.cy, fly) - Math.sin(Math.PI * fly) * 70;
+      fs = lerp(CAND_FS, q.fs, fly);
+      o = rise;
+      color = ACCENT;
+    }
+    w.style.fontSize = fs + "px";
+    w.style.color = color;
+    place(w, x, cy - fs * 0.5, o * (1 - exit), "");
+    w.style.transform += ` translateY(${-exit * 40}px)`;
+
+    // pills
+    const pill = pills[i];
+    if (i < 5) {
+      const pin = stag(i, 4.7, 5.8, easeOut), pout = seg(t, 19.0, 19.6);
+      const padX = fs * 0.3, h = fs * 1.32;
+      pill.style.width = (wpx(i, fs) + padX * 2) + "px";
+      pill.style.height = h + "px";
+      place(pill, x - padX, cy - h / 2 - fs * 0.04, pin * (1 - pout) * (i === 0 || i === 3 ? lerp(1, 0.4, dimP) : 1),
+        ` scale(${lerp(0.94, 1, pin)})`);
+    } else pill.style.opacity = 0;
+  }
+
+  // ---- cursor ----
+  {
+    let cx, cyc, fs, o = 1, blink = 1;
+    if (t < 19) {
+      // follow the typing
+      let wi = 0, n = 0;
+      for (const [i, c, tt] of chars) if (t >= tt) { wi = i; n = c; }
+      const q = pose[wi];
+      fs = q.fs;
+      cx = q.x + prefixWidth(wi, n, fs) + fs * 0.06;
+      // after a finished word (before the next starts), sit after the space
+      const next = chars.find(([, , tt]) => tt > t);
+      if (n === WORDS[wi].length && next && next[0] !== wi) cx += SPACE * fs / 100 * 0.7;
+      if (n === 0) cx = q.x;
+      cyc = q.cy;
+      const idle = t < TYPE_START || t > TYPE_END + 0.15;
+      if (idle) blink = 0.5 + 0.5 * Math.cos((t - (t < TYPE_START ? 0 : TYPE_END)) * Math.PI * 2 / 1.05);
+      o = 1 - seg(t, 4.4, 4.75);
+    } else {
+      const p5 = pose[5];
+      fs = p5.fs;
+      const atSlot = p5.x;
+      const afterMat = p5.x + wpx(5, fs) + fs * 0.12;
+      const move = seg(t, 25.35, 25.85, easeInOutQuint);
+      cx = lerp(atSlot, afterMat, move);
+      cyc = p5.cy;
+      o = seg(t, 19.6, 20.1) * (1 - exit);
+      blink = 0.5 + 0.5 * Math.cos((t - 19.6) * Math.PI * 2 / 1.05);
+      // hide while "mat" is in flight over the slot
+      if (t > 24.45 && t < 25.45) blink *= 1 - Math.sin(Math.PI * seg(t, 24.45, 25.45, x => x)) ;
+    }
+    blink = easeInOut(clamp(blink * 1.6 - 0.3));
+    const h = fs * 0.92, w = Math.max(6, fs * 0.055);
+    cursor.style.width = w + "px"; cursor.style.height = h + "px";
+    place(cursor, cx, cyc - h / 2 - exit * 40, o * blink);
+  }
+
+  // ---- captions ----
+  CAPS.forEach(([s, a, b], i) => {
+    const p = seg(t, a, a + 0.6, easeOut) * (1 - seg(t, b - 0.45, b, easeInOut));
+    const y = 130 + (1 - seg(t, a, a + 0.8, easeOutExpo)) * 18;
+    place(caps[i], W / 2 - capW[i] / 2, y, p);
+  });
+
+  // ---- numbers ----
+  for (let r = 0; r < ROWS; r++) {
+    const rowY = 540 + (r - 2) * 150 - 20;
+    for (let c = 0; c < COLS; c++) {
+      const e = nums[r][c];
+      const fin = seg(t, 10.0 + c * 0.055 + r * 0.06, 10.5 + c * 0.055 + r * 0.06, easeOut);
+      const fout = seg(t, 12.55 + (COLS - c) * 0.025, 12.95 + (COLS - c) * 0.025, easeInOut);
+      const vis = fin * (1 - fout);
+      if (vis <= 0.001) { e.style.opacity = 0; continue; }
+      const phase = (t - 10.2) * 5.2 - c * 0.62 - r * 0.38;
+      const crest = Math.pow(Math.max(0, Math.cos(phase)), 8);
+      const k = Math.floor((phase + Math.PI) / (2 * Math.PI));
+      const v = (hash(r, c, k) * 2 - 1) * 1.6;
+      e.textContent = fmt(v);
+      const x = COL0 + c * COLW;
+      const edge = clamp((W - 60 - x) / 520);
+      const g = Math.round(lerp(110, 255, crest)), gc = Math.round(lerp(110, 106, crest)), gb = Math.round(lerp(110, 61, crest));
+      e.style.color = `rgb(${g},${gc},${gb})`;
+      place(e, x + (1 - fin) * -24, rowY - crest * 10, vis * edge * lerp(0.75, 1, crest));
+    }
+  }
+
+  // ---- attention ----
+  {
+    const out = 1 - seg(t, 18.2, 19.0);
+    LINKS.forEach(([a, b, side, hgt, sw, start], j) => {
+      const qa = pose[a], qb = pose[b];
+      const xa = qa.x + wpx(a, qa.fs) / 2, xb = qb.x + wpx(b, qb.fs) / 2;
+      const ya = qa.cy + side * qa.fs * 0.82, yb = qb.cy + side * qb.fs * 0.82;
+      const d = `M ${xa} ${ya} C ${xa} ${ya + side * hgt}, ${xb} ${yb + side * hgt}, ${xb} ${yb}`;
+      const path = arcs[j];
+      path.setAttribute("d", d);
+      const L = path.getTotalLength();
+      const draw = seg(t, start, start + 1.1, easeInOut);
+      path.setAttribute("stroke-width", sw);
+      path.setAttribute("stroke-dasharray", `${L} ${L}`);
+      path.setAttribute("stroke-dashoffset", L * (1 - draw));
+      path.setAttribute("opacity", (draw > 0 ? 0.85 : 0) * out);
+      // a single soft point of light travelling along each line, twice
+      const dot = dots[j];
+      let dp = -1;
+      for (const s0 of [start + 1.3, start + 2.6]) {
+        const p = (t - s0) / 1.1;
+        if (p >= 0 && p <= 1) dp = easeInOut(p);
+      }
+      if (dp >= 0) {
+        const pt = path.getPointAtLength(L * dp);
+        dot.setAttribute("cx", pt.x); dot.setAttribute("cy", pt.y);
+        dot.setAttribute("opacity", Math.sin(Math.PI * dp) * out);
+      } else dot.setAttribute("opacity", 0);
+    });
+  }
+
+  // ---- candidates ----
+  {
+    const fadeOthers = seg(t, 24.1, 24.6);
+    const fadeAll = seg(t, 24.4, 24.9);
+    CANDS.forEach(([w, pct], i) => {
+      const rise = seg(t, 19.55 + i * 0.12, 20.35 + i * 0.12, easeOut);
+      const y = candY(i) + (1 - rise) * 60;
+      const grow = seg(t, 20.4 + i * 0.1, 21.9 + i * 0.1, easeInOutQuint);
+      const rowFade = i === 0 ? 1 : 1 - fadeOthers;
+      if (candWords[i]) {
+        const e = candWords[i];
+        e.style.fontSize = CAND_FS + "px";
+        e.style.color = "#8f8f8f";
+        place(e, CAND_RIGHT - candWidth[i], y - CAND_FS / 2, rise * rowFade);
+      }
+      const len = BAR_MAX * pct / 62 * grow;
+      const bar = bars[i];
+      bar.style.width = Math.max(14, len) + "px";
+      bar.style.background = i === 0 ? ACCENT : "rgba(255,255,255,0.26)";
+      place(bar, BAR_X, y - 7, rise * rowFade * (1 - fadeAll));
+      const pe = pcts[i];
+      pe.textContent = Math.round(pct * grow) + "%";
+      pe.style.color = i === 0 ? "#f5f3f0" : "#8f8f8f";
+      place(pe, BAR_X + Math.max(14, len) + 30, y - 26, rise * rowFade * (1 - fadeAll));
+    });
+  }
+
+  // ---- finale ----
+  {
+    const a = seg(t, 27.25, 27.95, easeOutExpo), b = seg(t, 27.4, 28.1, easeOutExpo);
+    const fa = seg(t, 27.25, 27.75), fb = seg(t, 27.4, 27.9);
+    place(fin1, W / 2 - fin1.offsetWidth / 2, 540 - 150 + (1 - a) * 50, fa);
+    place(fin2, W / 2 - fin2.offsetWidth / 2, 540 + 10 + (1 - b) * 50, fb);
+  }
+}
+
+window.ready = (async () => {
+  await document.fonts.load('600 100px "Disp"');
+  await document.fonts.load('500 40px "Text"');
+  await document.fonts.ready;
+  measure();
+  buildPoses();
+  capW = caps.map(e => e.offsetWidth);
+  candWidth = CANDS.map(() => 0);
+  candWords.forEach((e, i) => { if (e) { e.style.fontSize = CAND_FS + "px"; candWidth[i] = e.offsetWidth; } });
+  window.renderFrame = renderFrame;
+  renderFrame(0);
+  return true;
+})();
+</script>
+</body>
+</html>
