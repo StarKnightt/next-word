@@ -32,3 +32,18 @@ npm run keynote:music    # soundtrack only → output/next-word-keynote-soundtra
 - `keynote/music.mjs`: the soundtrack, synthesized from scratch: polyBLEP supersaws, FM bells, a sine kick, noise claps/hats/risers, a biquad filter, a Freeverb-style reverb, a ping-pong delay, sidechain and a limiter. No samples or plugins. The noise and dither use a fixed seed, so the WAV comes out bit-identical on every run.
 
 Story, in four chapters on the beat: split into tokens → attention (causal: each word only looks back) → scores become probabilities → pick one and go again.
+
+## PALE MERIDIAN: opening titles for a film that doesn't exist (15 s)
+
+[`output/pale-meridian.mp4`](output/pale-meridian.mp4): 1920×1080, 60 fps, 2.39:1 letterbox, H.264 + AAC 320k.
+
+> *They sent one signal. Across nine hundred years. Something answered.*
+
+```sh
+npm run film          # synthesizes the score, renders 900 frames (software WebGL, ~40 min), muxes
+npm run film:music    # score only → output/pale-meridian-score.wav
+```
+
+- `film/cues.js`: the shot list and the beat map. 80 BPM, so one beat is exactly 45 frames. Every cut, flash and title lands on a whole beat, and the score reads the same file.
+- `film/scene.html`: two WebGL2 passes. The first renders the scene in HDR: a planet limb at dawn with atmospheric scattering and city lights, a nebula fly-through with true motion-streaked stars and a beacon that pulses on the beat, and an eclipse with an animated corona, a diamond ring and a segmented orbital ring. The typography is drawn onto a canvas and composited in that pass, so it blooms with the light. The second pass is the lens and film stage: chromatic aberration, mip-chain bloom, an anamorphic streak, ACES tone mapping, a teal/amber grade, vignette, grain and the letterbox.
+- `film/music.mjs`: the score, synthesized from scratch: brass "braams" from filtered detuned saws, a formant-filtered synth choir, taiko, FM metal hits, a Shepard-tone riser, a reverse swell into one beat of silence, and a long hall reverb. Dm → B♭ → Gm → A → Dm(add9). No samples or plugins, seeded noise, bit-identical output.

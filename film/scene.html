@@ -1,0 +1,392 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pale Meridian</title>
+<style>
+  @font-face { font-family: "Thin"; src: url("../fonts/InterDisplay-ExtraLight.otf"); font-weight: 200; }
+  @font-face { font-family: "Light"; src: url("../fonts/Inter-Light.otf"); font-weight: 300; }
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+<script src="cues.js"></script>
+</head>
+<body>
+<canvas id="gl" width="1920" height="1080"></canvas>
+<script>
+// Two passes: (1) the scene in HDR, with the typography composited in so it blooms too;
+// (2) a lens/film pass: chromatic aberration, mip bloom, anamorphic streak, ACES, grade,
+// grain, letterbox. Everything is a pure function of t.
+const W = 1920, H = 1080, FPS = 60;
+const F = globalThis.FILM, BEAT = 60 / F.BPM;
+const cv = document.getElementById("gl");
+const gl = cv.getContext("webgl2", { preserveDrawingBuffer: true, antialias: false });
+gl.getExtension("EXT_color_buffer_float");
+gl.getExtension("OES_texture_float_linear");
+
+const VS = `#version 300 es
+in vec2 a; out vec2 vUv; void main(){ vUv = a*.5+.5; gl_Position = vec4(a,0,1); }`;
+
+const SCENE = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform vec2 uRes; uniform float uT, uL, uBeat; uniform int uScene;
+uniform vec4 uP, uQ; uniform sampler2D uText; uniform float uTextGain;
+
+mat2 rot(float a){ float c=cos(a), s=sin(a); return mat2(c,-s,s,c); }
+float h21(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+vec2 h22(vec2 p){ float n=h21(p); return vec2(n, h21(p+n*17.13)); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.-2.*f);
+  return mix(mix(h21(i),h21(i+vec2(1,0)),u.x), mix(h21(i+vec2(0,1)),h21(i+1.),u.x), u.y); }
+float fbm(vec2 p){ float s=0., a=.5; mat2 m=mat2(1.6,1.2,-1.2,1.6);
+  for(int i=0;i<6;i++){ s+=a*vn(p); p=m*p; a*=.5; } return s; }
+
+// one layer of point stars
+vec3 starLayer(vec2 p, float sc, float dens, float seed){
+  vec2 q = p*sc + seed; vec2 id = floor(q), f = fract(q) - .5;
+  float b = h21(id + seed);
+  if (b < 1. - dens) return vec3(0);
+  vec2 r = (h22(id) - .5) * .7;
+  float d = length(f - r);
+  float k = sc * 0.0025;
+  float s = exp(-d*d/(k*k)) * pow((b - (1.-dens))/dens, 3.) * 1.3;
+  vec3 tint = mix(vec3(.7,.8,1.), vec3(1.,.85,.7), h21(id+9.1));
+  return tint * s;
+}
+vec3 stars(vec2 p, float dens){
+  return starLayer(p, 60., dens*0.5, 1.) + starLayer(p, 130., dens*0.3, 7.) * .6 + starLayer(p, 260., dens*0.2, 13.) * .4;
+}
+
+// ---- 0: limb of a dark planet at dawn ----
+vec3 limb(vec2 p, float lt){
+  p = rot(uP.x + 0.012*lt) * p;
+  p /= uP.z;
+  float R = 2.6;
+  float hy = -0.17 + uP.y*lt;
+  vec2 c = vec2(0., hy - R);
+  float d = length(p - c) - R;
+  float rise = uQ.x > 0.5 ? 1. : smoothstep(0., 3., lt);
+  vec2 sun = vec2(uP.w, hy - (R - sqrt(R*R - uP.w*uP.w)) + mix(-0.03, 0.006, rise));
+  float near = exp(-pow((p.x - sun.x) * 2.2, 2.));
+  vec3 col = stars(p + vec2(lt*0.004, 0.), 0.06) * smoothstep(0.0, 0.25, d);
+  float sd = length((p - sun) * vec2(1., 1.));
+  if (d > 0.) {
+    float a1 = exp(-d*110.), a2 = exp(-d*16.), a3 = exp(-d*3.5);
+    col += vec3(1.0,0.62,0.32) * a1 * (0.22 + 5.*near*(0.3+0.7*rise));
+    col += vec3(0.22,0.5,1.0) * a2 * 0.2 * (0.3 + 1.8*near);
+    col += vec3(0.05,0.12,0.25) * a3 * 0.12;
+    col += vec3(1.,0.9,0.78) * (0.00022 / (sd*sd + 0.000015)) * smoothstep(0.0, 0.006, d) * rise;
+  } else {
+    vec2 q = (p - c); float ang = atan(q.y, q.x);
+    float cl = fbm(vec2(ang*60., d*25.) + vec2(lt*0.04, 0.));
+    float rim = exp(d*90.);
+    col += vec3(1.0,0.5,0.24) * rim * (0.05 + 1.6*near*rise) * (0.4 + cl);
+    col += vec3(0.015,0.025,0.04) * cl * exp(d*4.);
+    // a scatter of city lights on the night side
+    vec2 g = vec2(ang*900., d*300.); vec2 id = floor(g);
+    float city = step(0.985, h21(id)) * exp(-length(fract(g)-.5)*7.) * smoothstep(-0.02,-0.2,d) * smoothstep(-0.6,-0.2,d);
+    col += vec3(1.,0.7,0.4) * city * 0.6;
+  }
+  return col;
+}
+
+// ---- 1: nebula drift toward a beacon ----
+vec3 nebula(vec2 p, float lt){
+  float z0 = lt * uP.x + uP.y;
+  vec3 col = vec3(0);
+  // clouds: three parallax layers flowing past the camera
+  for (int i = 0; i < 3; i++) {
+    float fi = float(i);
+    float ph = fract(z0*0.35 + fi/3.);
+    float s = exp2(ph*2.2);
+    vec2 q = p / s * 2.2 + vec2(fi*7.3, fi*3.1);
+    float n = fbm(q);
+    float m = fbm(q*0.6 + 4.);
+    float dens = smoothstep(0.42, 0.95, n);
+    float fade = smoothstep(0., 0.3, ph) * smoothstep(1., 0.7, ph);
+    vec3 tint = mix(vec3(0.05,0.32,0.42), vec3(0.95,0.42,0.16), smoothstep(0.35, 0.75, m));
+    col += tint * dens * fade * 0.55;
+  }
+  // stars streaming past, drawn as true segments over the shutter interval
+  float shutter = 0.006 + 0.03 * uP.x;
+  for (int l = 0; l < 4; l++) {
+    float fl = float(l);
+    float ph1 = fract(z0*0.5 + fl/4.), ph0 = ph1 - shutter;
+    float s1 = exp2(ph1*4.), s0 = exp2(ph0*4.);
+    float fade = smoothstep(0., 0.25, ph1) * smoothstep(1., 0.8, ph1);
+    float sc = 22.;
+    vec2 q = p / s1 * sc;
+    vec2 id0 = floor(q);
+    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+      vec2 id = id0 + vec2(x, y);
+      float b = h21(id + fl*11.);
+      if (b < 0.82) continue;
+      vec2 sp = (id + .5 + (h22(id + fl) - .5) * .7) / sc;
+      vec2 A = sp * s0, Bp = sp * s1;
+      vec2 pa = p - A, ba = Bp - A;
+      float hh = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-9), 0., 1.);
+      float d = length(pa - ba * hh);
+      float w = 0.0009 * s1;
+      float len = length(ba) / w + 1.;
+      vec3 tint = mix(vec3(.7,.82,1.), vec3(1.,.85,.7), h21(id + 3.3));
+      col += tint * exp(-d*d/(w*w)) * pow((b - 0.82) / 0.18, 2.) * 1.6 * fade / sqrt(len);
+    }
+  }
+  // the beacon: one point, pulsing on every beat
+  float pulse = exp(-fract(uBeat) * 4.5);
+  float r = length(p - vec2(0.02, 0.01));
+  col += vec3(0.65,0.85,1.) * (0.00012 / (r*r + 0.00002)) * (0.35 + 1.4*pulse) * (uQ.x > 0.5 ? 0. : 1.);
+  float ring = exp(-pow((r - fract(uBeat)*0.5) * 90., 2.)) * (1. - fract(uBeat)) * 0.35;
+  col += vec3(0.6,0.85,1.) * ring * (uQ.x > 0.5 ? 0. : 1.);
+  return col;
+}
+
+// ---- 2: eclipse with an orbital ring ----
+vec3 eclipse(vec2 p, float lt){
+  float zoom = uP.x * (1. + uP.w + 0.02*lt + (uQ.w > 1.5 ? 0.025*lt : 0.) + (uQ.w > 0.5 && uQ.w < 1.5 ? 0.12*lt : 0.));
+  p = (p - vec2(uP.y, uP.z)) / zoom;
+  float r0 = 0.24;
+  float r = length(p), a = atan(p.y, p.x);
+  vec2 sunDir = normalize(vec2(uQ.x, uQ.y));
+  float facing = max(dot(p / max(r, 1e-4), sunDir), 0.);
+  float dr = r - r0;
+  vec3 col = stars(p * zoom * 0.9, 0.05) * smoothstep(0.0, 0.2, dr);
+  float dia = uQ.z;
+  if (dr > 0.) {
+    float rays = fbm(vec2(a*7., r*2.5 - lt*0.03));
+    float fil = pow(fbm(vec2(a*22., r*1.2 - lt*0.02) + 3.), 3.) * 2.5;
+    float cor = exp(-dr*30.) * 0.6 + exp(-dr*7.) * (0.03 + 0.2*rays*rays) + exp(-dr*11.) * fil * 0.16;
+    cor *= 0.6 + 1.2 * pow(facing, 2.);
+    col += vec3(1.0,0.74,0.48) * cor;
+    col += vec3(1.,0.93,0.85) * exp(-dr*260.) * (0.7 + 2.5*pow(facing, 6.));
+    col += vec3(1.,0.92,0.8) * dia * exp(-dr*55.) * pow(facing, 60.) * 9.;
+    col += vec3(1.,0.95,0.9) * dia * (0.0007 / (dot(p - sunDir*r0*1.02, p - sunDir*r0*1.02) + 0.00003));
+  } else {
+    col += vec3(0.35,0.55,1.0) * exp(dr*70.) * 0.06;
+    col += vec3(1.,0.6,0.3) * exp(dr*120.) * pow(facing, 4.) * 0.5;
+  }
+  // the ring: a tilted circle, segmented like something built
+  vec2 q = rot(-0.18) * p;
+  float k = 0.16, Rr = 0.58;
+  vec2 e = vec2(q.x, q.y / k);
+  float le = length(e);
+  float f = le - Rr;
+  float grad = length(vec2(e.x, e.y / k)) / max(le, 1e-4);
+  float ds = abs(f) / grad;
+  float front = step(q.y, 0.);
+  float vis = front + (1. - front) * smoothstep(r0 - 0.002, r0 + 0.004, r);
+  float seg = smoothstep(0.08, 0.0, abs(fract(atan(e.y, e.x) * 9.549) - 0.5) - 0.42);
+  float light = 0.25 + 1.6 * pow(max(dot(normalize(e), sunDir), 0.), 3.);
+  float line = exp(-pow(ds * zoom * 1400., 2.)) * 1.2 + exp(-ds * zoom * 140.) * 0.08;
+  col += vec3(0.75,0.85,1.0) * line * vis * light * (0.6 + 0.4*seg);
+  return col;
+}
+
+// ---- 3: black, one line of light opening ----
+vec3 blackline(vec2 p, float lt){
+  float u = clamp(lt / 0.75, 0., 1.);
+  float len = 0.02 + 0.9 * u*u*u;
+  float l = exp(-abs(p.y) * 1400.) * smoothstep(len, len*0.6, abs(p.x)) * (0.4 + 2.5*u*u);
+  return vec3(1.,0.68,0.42) * l;
+}
+
+void main(){
+  vec2 p = (gl_FragCoord.xy - uRes*.5) / uRes.y;
+  vec3 col;
+  if (uScene == 0) col = limb(p, uL);
+  else if (uScene == 1) col = nebula(p, uL);
+  else if (uScene == 2) col = eclipse(p, uL);
+  else col = blackline(p, uL);
+  vec4 tx = texture(uText, vec2(vUv.x, 1. - vUv.y));
+  col = col * (1. - tx.a * 0.6) + tx.rgb * uTextGain;
+  o = vec4(col, 1.);
+}`;
+
+const POST = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uScene; uniform vec2 uRes; uniform float uFrame, uExposure, uFade, uAberr;
+float h21(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0., 1.); }
+void main(){
+  vec2 uv = vUv, cc = uv - .5;
+  float r2 = dot(cc, cc);
+  float ab = (0.0025 + 0.012 * r2) * uAberr;
+  vec3 c;
+  c.r = texture(uScene, uv - cc * ab).r;
+  c.g = texture(uScene, uv).g;
+  c.b = texture(uScene, uv + cc * ab).b;
+  // bloom from the mip chain (wide, soft, physically-ish)
+  vec3 bl = vec3(0);
+  bl += max(textureLod(uScene, uv, 2.).rgb - 0.8, 0.) * 0.5;
+  bl += max(textureLod(uScene, uv, 4.).rgb - 0.25, 0.) * 0.9;
+  bl += textureLod(uScene, uv, 6.).rgb * 0.7;
+  bl += textureLod(uScene, uv, 8.).rgb * 0.6;
+  c += bl * 0.35;
+  // anamorphic streak: a long, thin, blue flare off every hot spot
+  vec3 st = vec3(0);
+  for (int i = -40; i <= 40; i++) {
+    float fi = float(i);
+    vec3 s = textureLod(uScene, uv + vec2(fi * 0.0065, 0.), 3.).rgb;
+    st += max(s - 1.6, 0.) * exp(-abs(fi) * 0.06);
+  }
+  c += st * vec3(0.35, 0.55, 1.0) * 0.07;
+  c *= uExposure;
+  c = aces(c);
+  // grade: cool shadows, warm highlights, a little lifted black
+  float lum = dot(c, vec3(.2126,.7152,.0722));
+  c = mix(c * vec3(0.86, 1.0, 1.1), c * vec3(1.06, 1.0, 0.9), smoothstep(0.05, 0.7, lum));
+  c = pow(c, vec3(1./2.2));
+  c = c * 0.97 + 0.012;
+  // vignette, grain, fade
+  c *= 1. - 0.45 * smoothstep(0.15, 0.75, length(cc * vec2(1.25, 1.)));
+  c += (h21(uv * uRes + fract(uFrame * 0.6180339) * 491.) - .5) * 0.045;
+  c *= uFade;
+  // 2.39:1 letterbox
+  float bar = (uRes.y - uRes.x / 2.39) * .5;
+  if (gl_FragCoord.y < bar || gl_FragCoord.y > uRes.y - bar) c = vec3(0);
+  o = vec4(clamp(c, 0., 1.), 1.);
+}`;
+
+function prog(fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, VS], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.bindAttribLocation(p, 0, "a"); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name; u[nm] = gl.getUniformLocation(p, nm); }
+  return { p, u };
+}
+const sceneP = prog(SCENE), postP = prog(POST);
+const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+// HDR target with mips (the bloom reads them)
+const hdr = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, hdr);
+const LEVELS = 1 + Math.floor(Math.log2(Math.max(W, H)));
+gl.texStorage2D(gl.TEXTURE_2D, LEVELS, gl.RGBA16F, W, H);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const fbo = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, hdr, 0);
+
+// typography canvas → texture
+const tc = document.createElement("canvas"); tc.width = W; tc.height = H;
+const tx = tc.getContext("2d");
+const ttex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, ttex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// ---------- timing helpers ----------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const win = (x, a, b) => clamp((x - a) / (b - a));
+const eo = p => 1 - Math.pow(1 - p, 3);
+const sm = p => p * p * (3 - 2 * p);
+
+// tracked caps, revealed letter by letter out of a blur
+function tracked(s, cx, cy, size, track, fam, wgt, bt, b0, b1, { stagger = 0.06, color = "255,244,232", from = "center" } = {}) {
+  tx.font = `${wgt} ${size}px "${fam}"`;
+  tx.letterSpacing = "0px";
+  const ws = [...s].map(ch => tx.measureText(ch).width);
+  const gap = size * track;
+  const total = ws.reduce((a, b) => a + b, 0) + gap * (s.length - 1);
+  let x = cx - total / 2;
+  const n = s.length, mid = (n - 1) / 2;
+  for (let i = 0; i < n; i++) {
+    const order = from === "center" ? Math.abs(i - mid) : i;
+    const pin = sm(win(bt, b0 + order * stagger, b0 + order * stagger + 0.9));
+    const pout = sm(win(bt, b1 - 0.6, b1));
+    const a = pin * (1 - pout);
+    if (a > 0.002 && s[i] !== " ") {
+      const blur = (1 - pin) * 14 + pout * 10;
+      tx.filter = blur > 0.3 ? `blur(${blur.toFixed(2)}px)` : "none";
+      tx.fillStyle = `rgba(${color},${a})`;
+      tx.fillText(s[i], x, cy);
+    }
+    x += ws[i] + gap;
+  }
+  tx.filter = "none";
+}
+
+function drawText(bt) {
+  tx.clearRect(0, 0, W, H);
+  tx.textBaseline = "middle";
+  for (const [s, b0, b1] of F.LINES) {
+    if (bt < b0 - 0.1 || bt > b1 + 0.1) continue;
+    // lines drift very slightly wider as they hold
+    const track = 0.42 + 0.06 * win(bt, b0, b1);
+    tracked(s, W / 2, 872, 44, track, "Light", 300, bt, b0, b1, { stagger: 0.035 });
+  }
+  if (bt >= F.TITLE_IN) {
+    const track = 0.34 + 0.07 * win(bt, F.TITLE_IN, 20);
+    tracked(F.TITLE, W / 2, 726, 132, track, "Thin", 200, bt, F.TITLE_IN, F.FADE_OUT[1] + 1, { stagger: 0.045 });
+    const [sub, sb] = F.SUB;
+    if (bt >= sb) tracked(sub, W / 2, 856, 40, 0.9, "Light", 300, bt, sb, F.FADE_OUT[1] + 1, { stagger: 0.05, color: "255,170,120" });
+  }
+}
+
+function shotAt(bt) {
+  let s = F.SHOTS[0];
+  for (const sh of F.SHOTS) if (bt >= sh[0]) s = sh;
+  return s;
+}
+
+function renderFrame(t) {
+  const bt = t / BEAT;
+  const [b0, scene, P, Q] = shotAt(bt);
+  const lt = t - b0 * BEAT;
+  drawText(bt);
+  gl.bindTexture(gl.TEXTURE_2D, ttex);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tc);
+
+  // pass 1
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(sceneP.p);
+  const u = sceneP.u;
+  gl.uniform2f(u.uRes, W, H); gl.uniform1f(u.uT, t); gl.uniform1f(u.uL, lt); gl.uniform1f(u.uBeat, bt);
+  gl.uniform1i(u.uScene, scene); gl.uniform4fv(u.uP, P); gl.uniform4fv(u.uQ, Q);
+  gl.uniform1f(u.uTextGain, 1.15);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, ttex); gl.uniform1i(u.uText, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindTexture(gl.TEXTURE_2D, hdr); gl.generateMipmap(gl.TEXTURE_2D);
+
+  // pass 2
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.useProgram(postP.p);
+  const v = postP.u;
+  let flash = 0, aberr = 1;
+  for (const h of F.HITS) if (bt >= h) { const k = Math.exp(-(bt - h) * 5); flash += k * (h === 16 ? 2.2 : h === 0 ? 0.6 : 1.4); aberr += k * 3; }
+  // exposure: fade up from black at the open, punch on every hit
+  const open = sm(win(bt, 0, 1.2));
+  const fade = 1 - sm(win(bt, F.FADE_OUT[0], F.FADE_OUT[1]));
+  gl.uniform2f(v.uRes, W, H); gl.uniform1f(v.uFrame, Math.round(t * FPS));
+  gl.uniform1f(v.uExposure, (0.25 + 0.75 * open) * (1 + flash)); gl.uniform1f(v.uFade, fade); gl.uniform1f(v.uAberr, aberr);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, hdr); gl.uniform1i(v.uScene, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.finish();
+}
+
+window.ready = (async () => {
+  await document.fonts.load('200 100px "Thin"');
+  await document.fonts.load('300 40px "Light"');
+  await document.fonts.ready;
+  window.renderFrame = renderFrame;
+  renderFrame(0);
+  return true;
+})();
+</script>
+</body>
+</html>
