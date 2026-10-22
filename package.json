@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "render": "node render.mjs out/next-word.mp4",
-    "stills": "node render.mjs --stills 1.6 4.2 6.5 11.2 16.8 22.5 24.9 26.2 29.0"
+    "stills": "node render.mjs --stills 1.6 4.2 6.5 11.2 16.8 22.5 24.9 26.2 29.0",
+    "keynote": "node keynote/render.mjs",
+    "keynote:music": "node keynote/music.mjs output/next-word-keynote-soundtrack.wav"
   },
   "dependencies": {
     "playwright": "1.56.1"

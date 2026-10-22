@@ -1,0 +1,465 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Next Word Keynote</title>
+<style>
+  @font-face { font-family: "Disp"; src: url("../fonts/InterDisplay-SemiBold.otf"); font-weight: 600; }
+  @font-face { font-family: "Disp"; src: url("../fonts/InterDisplay-Bold.otf"); font-weight: 700; }
+  @font-face { font-family: "Text"; src: url("../fonts/Inter-Medium.otf"); font-weight: 500; }
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+<script src="cues.js"></script>
+</head>
+<body>
+<canvas id="out" width="1920" height="1080"></canvas>
+<script>
+// Every frame is a pure function of t. Each frame averages SUB sub-frames across
+// half a frame interval (180° shutter) for real motion blur.
+const W = 1920, H = 1080, FPS = 60, SUB = 6, SHUTTER = 0.5;
+const CQ = globalThis.CUES, BEAT = 60 / CQ.BPM;
+const ORANGE = "#ff6a3d", WHITE = "#f4f2ee", GREY = "#8e8e8e";
+const out = document.getElementById("out").getContext("2d", { alpha: false });
+const bufC = document.createElement("canvas"); bufC.width = W; bufC.height = H;
+const g = bufC.getContext("2d", { alpha: false });
+
+// ---------- math ----------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, p) => a + (b - a) * p;
+const win = (x, a, b) => clamp((x - a) / (b - a));
+const eo = p => p >= 1 ? 1 : 1 - Math.pow(2, -10 * p);          // expo out
+const ei = p => p <= 0 ? 0 : Math.pow(2, 10 * p - 10);          // expo in
+const eio = p => p <= 0 ? 0 : p >= 1 ? 1 : p < 0.5 ? Math.pow(2, 20 * p - 10) / 2 : (2 - Math.pow(2, -20 * p + 10)) / 2;
+const c3 = p => p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+const bo = p => { const c1 = 1.9, c3_ = c1 + 1; return 1 + c3_ * Math.pow(p - 1, 3) + c1 * Math.pow(p - 1, 2); };
+const hash = (...n) => { let h = 2166136261; for (const v of n) { h ^= (v * 374761393) | 0; h = Math.imul(h, 16777619); h ^= h >>> 13; } return ((h >>> 0) % 100000) / 100000; };
+const pulse = (bt, at, k = 7) => bt >= at ? Math.exp(-(bt - at) * k) : 0;
+
+// ---------- text ----------
+function font(size, w = 600, fam = "Disp") { g.font = `${w} ${size}px "${fam}"`; g.letterSpacing = fam === "Disp" ? `${-0.028 * size}px` : "0px"; }
+const mcache = {};
+function tw(s, size, w = 600, fam = "Disp") {
+  const k = s + size + w + fam;
+  if (!(k in mcache)) { font(size, w, fam); mcache[k] = g.measureText(s).width; }
+  return mcache[k];
+}
+function text(s, x, y, size, { w = 600, fam = "Disp", color = WHITE, a = 1, align = "left", scale = 1 } = {}) {
+  if (a <= 0.002) return;
+  font(size, w, fam);
+  g.save();
+  g.globalAlpha = clamp(a);
+  g.fillStyle = color;
+  g.textBaseline = "middle";
+  const wd = tw(s, size, w, fam);
+  const ox = align === "center" ? -wd / 2 : align === "right" ? -wd : 0;
+  g.translate(x, y); g.scale(scale, scale);
+  g.fillText(s, ox, size * 0.04);
+  g.restore();
+}
+
+// ---------- shapes ----------
+function pill(x, y, w, h, { stroke = "rgba(255,255,255,0.32)", fill = "rgba(255,255,255,0.05)", lw = 2.5, draw = 1, a = 1 } = {}) {
+  if (a <= 0.002) return;
+  g.save(); g.globalAlpha = clamp(a);
+  g.beginPath(); g.roundRect(x - w / 2, y - h / 2, w, h, h / 2);
+  if (fill) { g.globalAlpha = clamp(a) * clamp(draw * 1.5); g.fillStyle = fill; g.fill(); g.globalAlpha = clamp(a); }
+  if (stroke && draw > 0) {
+    const per = 2 * (w - h) + Math.PI * h;
+    g.setLineDash([per * draw, per]); g.lineDashOffset = -per * 0.25;
+    g.strokeStyle = stroke; g.lineWidth = lw; g.stroke();
+  }
+  g.restore();
+}
+function ring(x, y, r, a, lw = 3, color = ORANGE) {
+  if (a <= 0.002) return;
+  g.save(); g.globalAlpha = clamp(a); g.strokeStyle = color; g.lineWidth = lw;
+  g.beginPath(); g.arc(x, y, Math.max(0, r), 0, Math.PI * 2); g.stroke(); g.restore();
+}
+function cursor(x, y, h, a) {
+  if (a <= 0.002) return;
+  g.save(); g.globalAlpha = clamp(a); g.fillStyle = ORANGE;
+  g.beginPath(); g.roundRect(x, y - h / 2, Math.max(6, h * 0.06), h, 3); g.fill(); g.restore();
+}
+
+// ---------- layout ----------
+const WORDS = CQ.WORDS;
+function lineLayout(words, size, gap, cy) {
+  const ws = words.map(w => tw(w, size));
+  const total = ws.reduce((s, v) => s + v, 0) + gap * (words.length - 1);
+  let x = W / 2 - total / 2;
+  return ws.map(w => { const p = { x, cx: x + w / 2, cy, w, size }; x += w + gap; return p; });
+}
+const SPACE = s => tw("a a", s) - tw("aa", s);
+
+// ---------- chapter labels ----------
+function chapter(bt, num, label, b0, b1) {
+  const pin = eo(win(bt, b0, b0 + 0.6)), pout = ei(win(bt, b1 - 0.5, b1));
+  const a = pin * (1 - pout);
+  if (a <= 0) return;
+  const x = 120 - (1 - pin) * 40 - pout * 30;
+  text(num, x, 120, 44, { fam: "Text", w: 500, color: ORANGE, a });
+  text(label, x + 74, 120, 44, { fam: "Text", w: 500, color: WHITE, a });
+  // a thin rule that draws with the beat
+  g.save(); g.globalAlpha = a * 0.35; g.fillStyle = WHITE;
+  g.fillRect(x, 160, 260 * eo(win(bt, b0 + 0.25, b0 + 1.25)), 2); g.restore();
+}
+function caption(bt, s, b0, b1) {
+  const pin = eo(win(bt, b0, b0 + 0.5)), pout = ei(win(bt, b1 - 0.4, b1));
+  const a = pin * (1 - pout);
+  text(s, W / 2, 965 + (1 - pin) * 20 - pout * 10, 46, { fam: "Text", w: 500, color: GREY, a, align: "center" });
+}
+
+// =================================================================
+// scene drawing: bt = time in beats
+function draw(t) {
+  const bt = t / BEAT;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+  g.fillStyle = "#030303"; g.fillRect(0, 0, W, H);
+
+  // camera: slow push per scene, bump on every kick, shake on impacts
+  let zoom = 1, sx = 0, sy = 0;
+  const kickOn = bt >= 8 && bt < 32;
+  if (kickOn) zoom += 0.006 * pulse(bt, Math.floor(bt), 9);
+  for (const [b, amp] of [[0, 10], [8, 14], [24, 10], [32, 12], [33, 16], [36, 14]]) {
+    const p = pulse(bt, b, 9);
+    sx += Math.sin(bt * 91.7 + b) * amp * p; sy += Math.cos(bt * 77.3 + b) * amp * p;
+    zoom += 0.012 * p;
+  }
+  const scene = bt < 8 ? 0 : bt < 16 ? 1 : bt < 24 ? 2 : bt < 32 ? 3 : bt < 36 ? 4 : 5;
+  const sceneStart = [0, 8, 16, 24, 32, 36][scene];
+  zoom *= 1 + 0.025 * (bt - sceneStart) / 8;
+  g.setTransform(zoom, 0, 0, zoom, W / 2 * (1 - zoom) + sx, H / 2 * (1 - zoom) + sy);
+
+  [intro, tokens, attention, scores, pick, title][scene](bt);
+}
+
+// ---------- 0: intro (beats 0-8) ----------
+const SLAM_SIZE = 330;
+const SLAM_FROM = [[0, 0, 1.7], [520, 0, 1], [0, -380, 1], [-520, 0, 1], [0, 0, 0.55]];
+function sentenceFinal(size = 150, cy = 540) { return lineLayout(WORDS, size, SPACE(size), cy); }
+
+function intro(bt) {
+  // beat 0: a line of light cuts across, then folds into the cursor
+  if (bt < 1) {
+    const grow = eo(win(bt, 0, 0.55)), fold = eio(win(bt, 0.55, 1));
+    const w = lerp(lerp(0, 1500, grow), 12, fold), h = lerp(4, 230, fold);
+    g.save(); g.fillStyle = ORANGE; g.globalAlpha = 1;
+    g.beginPath(); g.roundRect(W / 2 - w / 2, 540 - h / 2, w, h, 3); g.fill(); g.restore();
+    ring(W / 2, 540, 40 + 900 * eo(win(bt, 0, 1.2)), (1 - win(bt, 0, 1.2)) * 0.5, 2);
+    return;
+  }
+  const lay = sentenceFinal();
+  if (bt < 6) {
+    // one word per beat, each from a different direction
+    const i = Math.min(4, Math.floor(bt) - 1), u = bt - (i + 1);
+    const [dx, dy, s0] = SLAM_FROM[i];
+    const p = eo(clamp(u / 0.4));
+    const sc = lerp(s0, 1, p);
+    const x = W / 2 + dx * (1 - p), y = 540 + dy * (1 - p);
+    text(WORDS[i], x, y, SLAM_SIZE, { w: 700, align: "center", scale: sc, a: clamp(u / 0.06) });
+    const half = tw(WORDS[i], SLAM_SIZE, 700) / 2 * sc;
+    cursor(x + half + 26, y, SLAM_SIZE * 0.72 * sc, 1);
+    ring(W / 2, 540, 120 + 700 * eo(clamp(u / 0.9)), (1 - clamp(u / 0.9)) * 0.25, 2, WHITE);
+    return;
+  }
+  // beat 6+: the last slammed word lands in its place, the others fly in on 16ths
+  for (let i = 0; i < 5; i++) {
+    const L = lay[i];
+    if (i === 4) {
+      const p = eio(win(bt, 6, 6.75));
+      const size = lerp(SLAM_SIZE * 1.0, L.size, p);
+      const wgt = p < 0.5 ? 700 : 600;
+      text(WORDS[i], lerp(W / 2, L.cx, p), 540, size, { w: wgt, align: "center" });
+      continue;
+    }
+    const b0 = CQ.ASSEMBLE[i], p = eo(win(bt, b0, b0 + 0.6));
+    const [dx, dy] = SLAM_FROM[i];
+    const k = i === 0 ? [0, 220] : [dx * 0.5, dy * 0.5];
+    text(WORDS[i], L.cx + k[0] * (1 - p), 540 + k[1] * (1 - p), L.size, { align: "center", a: p, scale: lerp(i === 0 ? 0.6 : 1, 1, p) });
+  }
+  const last = lay[4];
+  const cx = last.x + last.w + 18;
+  const blink = bt < 6.75 ? 1 : (Math.floor(bt * 2) % 2 === 0 ? 1 : 0.15);
+  cursor(lerp(W / 2 + tw("the", SLAM_SIZE, 700) / 2 + 26, cx, eio(win(bt, 6, 6.75))), 540, lerp(SLAM_SIZE * 0.72, 150 * 0.8, eio(win(bt, 6, 6.75))), blink);
+  // tension before the drop: the letters start to tremble
+  const tr = win(bt, 7.25, 8);
+  if (tr > 0) {
+    g.save(); g.globalAlpha = 0.12 * tr; g.strokeStyle = ORANGE; g.lineWidth = 2;
+    for (let i = 0; i < 4; i++) { const L = lay[i], R = lay[i + 1]; const mx = (L.x + L.w + R.x) / 2; g.beginPath(); g.moveTo(mx, 540 - 80 * tr); g.lineTo(mx, 540 + 80 * tr); g.stroke(); }
+    g.restore();
+  }
+}
+
+// ---------- 1: tokens (beats 8-16) ----------
+const CHIP_SIZE = 116, CHIP_Y = 420;
+function chipsLayout() { return lineLayout(WORDS, CHIP_SIZE, 92, CHIP_Y); }
+
+function tokens(bt) {
+  const from = sentenceFinal(), to = chipsLayout();
+  ring(W / 2, 540, 60 + 1500 * eo(win(bt, 8, 10)), (1 - win(bt, 8, 10)) * 0.7, 3);
+  const exit = ei(win(bt, 15.5, 16));
+  for (let i = 0; i < 5; i++) {
+    const p = bo(win(bt, 8 + i * 0.06, 8.7 + i * 0.06));
+    const L = from[i], T = to[i];
+    const cx = lerp(L.cx, T.cx, p), cy = lerp(540, T.cy, eo(win(bt, 8, 8.8)));
+    const size = lerp(L.size, T.size, eo(win(bt, 8, 8.6)));
+    const flash = pulse(bt, CQ.CHIP_FLASH(i), 4);
+    const draw = eo(win(bt, 8.1 + i * 0.08, 8.9 + i * 0.08));
+    const w = tw(WORDS[i], size) + size * 0.62, h = size * 1.32;
+    pill(cx, cy, w, h, {
+      draw, stroke: flash > 0.02 ? `rgba(255,106,61,${0.35 + 0.65 * flash})` : "rgba(255,255,255,0.32)",
+      fill: `rgba(255,${Math.round(255 - 149 * flash)},${Math.round(255 - 194 * flash)},${0.05 + 0.12 * flash})`,
+    });
+    text(WORDS[i], cx, cy, size, { align: "center" });
+
+    // numbers: the token's vector, dropping in on 16ths
+    for (let j = 0; j < CQ.NUMS_PER_CHIP; j++) {
+      const b0 = CQ.NUM_DROP(i, j);
+      const q = eo(win(bt, b0, b0 + 0.5));
+      if (q <= 0) continue;
+      const k = bt < 14 ? Math.floor(bt * 4) : 999; // values flicker on 16ths, then settle
+      const v = (hash(i, j, Math.max(Math.floor(b0 * 4), k)) * 2 - 1) * 1.8;
+      const s = (v < 0 ? "−" : "") + Math.abs(v).toFixed(2);
+      const yy = cy + 140 + j * 62 + (1 - q) * -40 - exit * 60;
+      const hot = pulse(bt, b0, 5);
+      const col = `rgb(${Math.round(lerp(150, 255, hot))},${Math.round(lerp(150, 106, hot))},${Math.round(lerp(150, 61, hot))})`;
+      text(s, cx, yy, 40, { fam: "Text", w: 500, color: col, a: q * (1 - exit) * (1 - j * 0.12), align: "center" });
+    }
+  }
+  chapter(bt, "01", "tokens", 8, 16);
+  caption(bt, "the sentence is split into tokens", 8.5, 10);
+  caption(bt, "and every token becomes a list of numbers", 10, 15.7);
+}
+
+// ---------- 2: attention (beats 16-24) ----------
+const RING_C = [960, 440], RX = 560, RY = 255, ATT_SIZE = 96;
+function ringPos(i, bt) {
+  const a = Math.PI + i * (Math.PI / 4) + 0.04 * Math.sin(bt * 0.4); // left to right along the upper arc
+  return [RING_C[0] + Math.cos(a) * RX, RING_C[1] + Math.sin(a) * RY + 120];
+}
+function attention(bt) {
+  const from = chipsLayout();
+  const m = eio(win(bt, 16, 16.75));
+  const collapse = eio(win(bt, 23, 24));
+  const pos = [];
+  for (let i = 0; i < 5; i++) {
+    const [rx, ry] = ringPos(i, bt);
+    let x = lerp(from[i].cx, rx, m), y = lerp(from[i].cy, ry, m);
+    if (i !== 4) { x = lerp(x, pos4(bt)[0], collapse); y = lerp(y, pos4(bt)[1], collapse); }
+    pos.push([x, y]);
+  }
+  function pos4(b) { const [rx, ry] = ringPos(4, b); return [rx, ry]; }
+
+  // links: drawn as curves bowing up and away from the ring
+  const gather = eo(win(bt, 21.5, 22.25));
+  for (const [f, to, b0, wt] of CQ.LINKS) {
+    const p = eo(win(bt, b0, b0 + 0.45));
+    if (p <= 0) continue;
+    const [x0, y0] = pos[f], [x1, y1] = pos[to];
+    const mx = (x0 + x1) / 2, my = Math.max(y0, y1) + 110 + Math.abs(x1 - x0) * 0.36; // bow down into the empty middle
+    const fromLast = f === 4;
+    const base = fromLast ? lerp(0.35, 0.45 + 0.55 * wt, gather) : lerp(0.35, 0.12, gather);
+    const flash = pulse(bt, b0, 4);
+    const a = clamp(base + flash * 0.6) * (1 - collapse);
+    g.save();
+    g.strokeStyle = fromLast || flash > 0.1 ? ORANGE : WHITE;
+    g.globalAlpha = a; g.lineCap = "round";
+    g.lineWidth = fromLast ? lerp(2, 2 + 7 * wt, gather) * (1 + 0.25 * pulse(bt, Math.floor(bt), 6) * gather) : 2;
+    // partial quadratic: draw up to p using de Casteljau
+    const qx = (u) => (1 - u) * (1 - u) * x0 + 2 * (1 - u) * u * mx + u * u * x1;
+    const qy = (u) => (1 - u) * (1 - u) * y0 + 2 * (1 - u) * u * my + u * u * y1;
+    g.beginPath(); g.moveTo(x0, y0);
+    for (let k = 1; k <= 48; k++) { const u = p * k / 48; g.lineTo(qx(u), qy(u)); }
+    g.stroke();
+    if (p < 1) { g.fillStyle = "#ffe1d6"; g.globalAlpha = 1; g.beginPath(); g.arc(qx(p), qy(p), 6, 0, Math.PI * 2); g.fill(); }
+    g.restore();
+  }
+
+  for (let i = 0; i < 5; i++) {
+    const [x, y] = pos[i];
+    let hot = 0;
+    for (const [f, to, b0] of CQ.LINKS) { if (f === i) hot = Math.max(hot, pulse(bt, b0, 4)); if (to === i) hot = Math.max(hot, pulse(bt, b0 + 0.3, 5) * 0.7); }
+    const isLast = i === 4;
+    const fillO = isLast ? gather : 0;
+    const size = lerp(CHIP_SIZE, ATT_SIZE, m) * (isLast ? 1 + 0.15 * gather - 0.9 * collapse : 1 - 0.5 * collapse);
+    const w = tw(WORDS[i], size) + size * 0.62, h = size * 1.32;
+    const a = isLast ? 1 - win(bt, 23.6, 24) : 1 - collapse;
+    pill(x, y, w, h, {
+      a, stroke: hot > 0.05 ? `rgba(255,106,61,${0.4 + 0.6 * hot})` : "rgba(255,255,255,0.32)",
+      fill: fillO > 0 ? `rgba(255,106,61,${fillO})` : `rgba(255,255,255,${0.05 + 0.1 * hot})`,
+    });
+    text(WORDS[i], x, y, size, { align: "center", a, color: fillO > 0.5 ? "#140803" : WHITE });
+  }
+  // the last word condenses into a single point of meaning
+  const dot = win(bt, 23.5, 24);
+  if (dot > 0) {
+    const [x, y] = pos[4];
+    g.save(); g.fillStyle = ORANGE; g.globalAlpha = 1;
+    g.beginPath(); g.arc(lerp(x, W / 2, eio(dot)), lerp(y, 540, eio(dot)), lerp(40, 14, dot), 0, Math.PI * 2); g.fill(); g.restore();
+  }
+  chapter(bt, "02", "attention", 16, 23.5);
+  caption(bt, "each word looks back at the words before it", 16.5, 21.5);
+  caption(bt, "the last word gathers what matters", 21.5, 23.5);
+}
+
+// ---------- 3: scores (beats 24-32) ----------
+const VOCAB = ["piano", "orbit", "yes", "river", "seven", "glass", "jump", "quiet", "paper", "storm", "blue", "honey",
+  "train", "since", "maybe", "cloud", "lemon", "north", "voice", "ocean", "small", "fire", "under", "garden",
+  "word", "light", "stone", "after", "tiger", "dream"];
+const ROW_H = 104, ROW0 = 330, WORD_R = 800, BAR_X = 846, BAR_MAX = 700;
+function scrollAt(bt) { return 3200 * (1 - eo(win(bt, 24, 27))); }
+function rowY(r, bt) { return ROW0 + r * ROW_H + scrollAt(bt); }
+
+function scores(bt) {
+  // burst out of the point
+  ring(W / 2, 540, 14 + 1400 * eo(win(bt, 24, 25.5)), (1 - win(bt, 24, 25.5)) * 0.8, 3);
+  const dotA = 1 - win(bt, 24, 24.2);
+  if (dotA > 0) { g.save(); g.fillStyle = ORANGE; g.beginPath(); g.arc(W / 2, 540, 14 * (1 + 4 * win(bt, 24, 24.2)), 0, Math.PI * 2); g.globalAlpha = dotA; g.fill(); g.restore(); }
+
+  const settle = win(bt, 26.6, 27);
+  const dimOthers = eo(win(bt, 30, 31));
+  const rows = [];
+  for (let r = -VOCAB.length; r < CQ.CANDS.length; r++) rows.push(r);
+  for (const r of rows) {
+    const y = rowY(r, bt);
+    if (y < 180 || y > 1020) continue;
+    const edge = clamp((y - 190) / 120) * clamp((1010 - y) / 160);
+    const isCand = r >= 0;
+    const word = isCand ? CQ.CANDS[r][0] : VOCAB[(r + VOCAB.length * 4) % VOCAB.length];
+    const pct = isCand ? CQ.CANDS[r][1] : 0;
+    const rank = isCand ? r : 99;
+    let a = edge * (isCand ? (rank < 4 ? 1 : lerp(0.5, 0.32, (rank - 4) / 2)) : 0.4 * (1 - settle));
+    if (isCand && rank > 0) a *= lerp(1, 0.35, dimOthers);
+    const isMat = r === 0;
+    const beatPulse = isMat && bt >= 29 ? pulse(bt, Math.floor(bt), 5) : 0;
+    const color = isMat ? ORANGE : rank < 4 ? WHITE : GREY;
+    text(word, WORD_R, y, 72, { align: "right", color: isCand ? color : GREY, a, scale: 1 + 0.04 * beatPulse });
+
+    // raw scores flicker while the reel spins, then become probabilities
+    const growB = isCand ? CQ.BAR_GROW[r] : 99;
+    const gp = isCand ? bo(win(bt, growB, growB + 0.7)) : 0;
+    const spinLen = (1 - settle) * (60 + 420 * hash(r, 7));
+    const len = Math.max(14, isCand ? lerp(spinLen, BAR_MAX * pct / 62, gp) : spinLen);
+    g.save(); g.globalAlpha = a * (isCand ? 1 : 0.6) * (gp > 0 ? 1 : 1 - settle);
+    g.fillStyle = isMat ? ORANGE : rank < 4 ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.3)";
+    g.beginPath(); g.roundRect(BAR_X, y - 8, len, 16, 8); g.fill(); g.restore();
+    if (gp > 0) {
+      const shown = Math.round(pct * clamp(win(bt, growB, growB + 0.6)));
+      text(shown + "%", BAR_X + len + 30, y, 54, { fam: "Text", w: 500, color: isMat ? WHITE : GREY, a: a * clamp(gp * 3) });
+    }
+  }
+  chapter(bt, "03", "scores", 24, 32);
+  caption(bt, "every word it knows gets a score", 24.5, 28);
+  caption(bt, "and the scores become probabilities", 28, 31.75);
+}
+
+// ---------- 4: pick (beats 32-36) ----------
+const PICK_SIZE = 140, PICK_Y = 470;
+function pickLayout() { return lineLayout([...WORDS, "mat"], PICK_SIZE, SPACE(PICK_SIZE), PICK_Y); }
+function pick(bt) {
+  const lay = pickLayout();
+  // the other candidates drop away
+  for (let r = 1; r < CQ.CANDS.length; r++) {
+    const fall = ei(win(bt, 32, 32.6)), y = ROW0 + r * ROW_H + fall * 700;
+    const a = (r < 4 ? 0.35 : 0.2) * (1 - win(bt, 32, 32.6));
+    text(CQ.CANDS[r][0], WORD_R, y, 72, { align: "right", color: WHITE, a });
+  }
+  // sentence drops in from above
+  const sin = eo(win(bt, 32, 32.6));
+  const whip = ei(win(bt, 35.6, 36));
+  for (let i = 0; i < 5; i++) {
+    const L = lay[i];
+    text(WORDS[i], L.cx, L.cy - (1 - sin) * 260 - whip * 40, L.size * (1 + whip * 0.8), { align: "center", a: sin * (1 - whip) });
+  }
+  // "mat" flies from the top of the list into its slot, landing on the beat
+  const M = lay[5];
+  const fp = eio(win(bt, CQ.FLY_START, CQ.LAND));
+  const x0 = WORD_R - tw("mat", 72) / 2, y0 = ROW0;
+  const mx = lerp(x0, M.cx, fp), my = lerp(y0, M.cy, fp) - Math.sin(Math.PI * fp) * 160;
+  const ms = lerp(72, PICK_SIZE, fp) * (1 + 0.12 * pulse(bt, CQ.LAND, 6)) * (1 + whip * 0.8);
+  text("mat", mx, my, ms, { align: "center", color: ORANGE, a: 1 - whip });
+  // bar of the winner shrinks into it
+  const bw = (1 - eo(win(bt, 32, 32.5))) * BAR_MAX;
+  if (bw > 1) { g.save(); g.fillStyle = ORANGE; g.beginPath(); g.roundRect(BAR_X, ROW0 - 8, bw, 16, 8); g.fill(); g.restore(); }
+  // landing
+  ring(M.cx, M.cy, 40 + 900 * eo(win(bt, CQ.LAND, 35)), (1 - win(bt, CQ.LAND, 35)) * 0.7 * (bt >= CQ.LAND ? 1 : 0), 3);
+  if (bt >= CQ.LAND) {
+    const blink = Math.floor(bt * 2) % 2 === 0 ? 1 : 0.15;
+    cursor(M.x + M.w + 18, M.cy, PICK_SIZE * 0.8, blink * (1 - whip));
+    // the next guess already flickering under the cursor
+    const ghosts = ["and", ".", "while", "again"];
+    if (bt >= 34.5 && bt < 35.6) {
+      const k = Math.floor((bt - 34.5) * 4) % ghosts.length;
+      text(ghosts[k], M.x + M.w + 50, M.cy + 140, 56, { fam: "Text", w: 500, color: GREY, a: 0.55 * (1 - whip) });
+    }
+  }
+  chapter(bt, "04", "pick", 32, 35.6);
+  caption(bt, "it picks one, adds it, and goes again", 33, 35.6);
+}
+
+// ---------- 5: title (beats 36-40) ----------
+function title(bt) {
+  const [b1, b2] = CQ.TITLE_LINES;
+  const p1 = eo(win(bt, b1, b1 + 0.6)), p2 = eo(win(bt, b2, b2 + 0.6));
+  const out = c3(win(bt, 39.4, 40));
+  text("one word", W / 2, 440 - (1 - p1) * 30, 190, { w: 700, align: "center", a: clamp((bt - b1) / 0.05) * (1 - out), scale: lerp(1.25, 1, p1) });
+  text("at a time.", W / 2, 650 + (1 - p2) * 30, 190, { w: 700, align: "center", color: ORANGE, a: clamp((bt - b2) / 0.05) * (1 - out), scale: lerp(1.25, 1, p2) });
+  ring(W / 2, 540, 80 + 1400 * eo(win(bt, b1, b1 + 2)), (1 - win(bt, b1, b1 + 2)) * 0.6, 3);
+  if (bt >= 38) {
+    const x = W / 2 + tw("at a time.", 190, 700) / 2 + 22;
+    cursor(x, 650, 150, (Math.floor(bt * 2) % 2 === 0 ? 1 : 0.15) * (1 - out));
+  }
+}
+
+// ---------- grain + vignette ----------
+let grain = [], vign;
+function buildGrain() {
+  let s = 12345;
+  const r = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+  for (let k = 0; k < 4; k++) {
+    const c = document.createElement("canvas"); c.width = 960; c.height = 540;
+    const x = c.getContext("2d"), im = x.createImageData(960, 540);
+    for (let i = 0; i < im.data.length; i += 4) { const v = 128 + (r() - 0.5) * 255; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
+    x.putImageData(im, 0, 0); grain.push(c);
+  }
+  vign = document.createElement("canvas"); vign.width = W; vign.height = H;
+  const v = vign.getContext("2d");
+  const rg = v.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 1.05);
+  rg.addColorStop(0, "rgba(0,0,0,0)"); rg.addColorStop(1, "rgba(0,0,0,0.55)");
+  v.fillStyle = rg; v.fillRect(0, 0, W, H);
+}
+
+function renderFrame(t) {
+  out.globalCompositeOperation = "source-over"; out.globalAlpha = 1;
+  out.fillStyle = "#000"; out.fillRect(0, 0, W, H);
+  out.globalCompositeOperation = "lighter";
+  out.globalAlpha = 1 / SUB;
+  for (let k = 0; k < SUB; k++) {
+    draw(t + (k / SUB) * SHUTTER / FPS);
+    out.drawImage(bufC, 0, 0);
+  }
+  out.globalCompositeOperation = "source-over"; out.globalAlpha = 1;
+  out.drawImage(vign, 0, 0);
+  const f = Math.round(t * FPS);
+  out.globalCompositeOperation = "overlay"; out.globalAlpha = 0.07;
+  out.imageSmoothingEnabled = false;
+  out.drawImage(grain[f % 4], 0, 0, W, H);
+  out.imageSmoothingEnabled = true;
+  out.globalCompositeOperation = "source-over"; out.globalAlpha = 1;
+}
+
+window.ready = (async () => {
+  await document.fonts.load('600 100px "Disp"');
+  await document.fonts.load('700 100px "Disp"');
+  await document.fonts.load('500 40px "Text"');
+  await document.fonts.ready;
+  buildGrain();
+  window.renderFrame = renderFrame;
+  renderFrame(0);
+  return true;
+})();
+</script>
+</body>
+</html>
